@@ -107,6 +107,17 @@ _LOGGABLE_INS = frozenset({
     JCconstants.INS_LIST_PINS,
 })
 
+# Bootstrap and already-wrapped instructions that may cross PC/SC without an
+# established applet secure channel. Everything else is encrypted by host
+# policy, independently of the unauthenticated value returned by GET_STATUS.
+_SECURE_CHANNEL_PLAINTEXT_INS = frozenset({
+    0xA4,                                       # ISO SELECT
+    0xFF,                                       # legacy reset / reader pseudo-APDU
+    JCconstants.INS_GET_STATUS,
+    JCconstants.INS_INIT_SECURE_CHANNEL,
+    JCconstants.INS_PROCESS_SECURE_CHANNEL,
+})
+
 
 def _redact_apdu(apdu):
     """Hex of a command APDU for logging, with the data field masked unless the
@@ -298,7 +309,8 @@ class CardConnector:
 
             #encrypt apdu
             ins= plain_apdu[1]
-            if (self.needs_secure_channel) and (ins not in [0xA4, 0x81, 0x82, 0xFF, JCconstants.INS_GET_STATUS]):
+            use_secure_channel = ins not in _SECURE_CHANNEL_PLAINTEXT_INS
+            if use_secure_channel:
                 apdu = self.card_encrypt_secure_channel(plain_apdu)
             else:
                 apdu= plain_apdu
@@ -310,7 +322,7 @@ class CardConnector:
             if (sw1==0x9C) and (sw2==0x06):
                 (response, sw1, sw2)= self.card_verify_PIN_simple()
             # secure channel session lost on the card side
-            # 0x9C20: secure channel required (we sent plaintext)
+            # 0x9C20: peer reports secure channel required
             # 0x9C21: secure channel not initialized
             # 0x9C22: wrong IV (counter desync)
             # 0x9C23: wrong MAC (key desync)
@@ -333,7 +345,7 @@ class CardConnector:
                 self.card_initiate_secure_channel()
             #decrypt response
             elif (sw1==0x90) and (sw2==0x00):
-                if (self.needs_secure_channel) and (ins not in [0xA4, 0x81, 0x82, 0xFF, JCconstants.INS_GET_STATUS]):
+                if use_secure_channel:
                     response= self.card_decrypt_secure_channel(response, ins)
                 return (response, sw1, sw2)
             else:
@@ -593,10 +605,12 @@ class CardConnector:
             else:
                 self.setup_done= d["setup_done"]= True    
             # secure channel status
-            if len(response) >=12:
-                self.needs_secure_channel= d["needs_secure_channel"]= False if response[11]==0X00 else True    
-            else:
-                self.needs_secure_channel= d["needs_secure_channel"]= False
+            card_requires_secure_channel = len(response) >= 12 and response[11] != 0X00
+            d["needs_secure_channel"] = card_requires_secure_channel
+            # GET_STATUS is intentionally plaintext, so its response may raise
+            # the cached requirement but must never lower it.
+            if card_requires_secure_channel:
+                self.needs_secure_channel = True
             # NFC policy
             if len(response) >=13:
                 self.nfc_policy= d["nfc_policy"]= response[12] # 0:NFC_ENABLED, 1:NFC_DISABLED, 2:NFC_BLOCKED
@@ -618,7 +632,7 @@ class CardConnector:
         elif (sw1==0x9c) and (sw2==0x04):
             self.setup_done= d["setup_done"]= False  
             self.is_seeded= d["is_seeded"]= False
-            self.needs_secure_channel= d["needs_secure_channel"]= False
+            d["needs_secure_channel"]= False
             
         else:
             logger.warning(f"Unknown error in get_status() (error code {hex(256*sw1+sw2)})")
@@ -2197,8 +2211,9 @@ class CardConnector:
         ins= JCconstants.INS_VERIFY_PIN
         apdu=[cla, ins, 0x00, 0x00, len(pin_0)] + pin_0
         
-        if (self.needs_secure_channel):
-            apdu = self.card_encrypt_secure_channel(apdu)
+        # PINs are always protected by host policy; GET_STATUS cannot opt this
+        # direct-transmit path out of the secure channel.
+        apdu = self.card_encrypt_secure_channel(apdu)
         response, sw1, sw2 = self.cardservice.connection.transmit(apdu)
 
         # secure channel session lost on the card side (same recovery as card_transmit)
@@ -2275,8 +2290,9 @@ class CardConnector:
             ins= JCconstants.INS_VERIFY_PIN
             apdu=[cla, ins, 0x00, 0x00, len(pin_0)] + pin_0
             
-            if (self.needs_secure_channel):
-                apdu = self.card_encrypt_secure_channel(apdu)
+            # This legacy API also bypasses card_transmit(), so enforce the
+            # same host-side secure-channel policy here.
+            apdu = self.card_encrypt_secure_channel(apdu)
             response, sw1, sw2 = self.cardservice.connection.transmit(apdu)
             
             # correct PIN: cache PIN value
@@ -2537,7 +2553,7 @@ class CardConnector:
         logger.debug("In card_encrypt_secure_channel()")
         
         # every path that needs encryption goes through here (card_transmit,
-        # card_verify_PIN_simple, card_verify_PIN_deprecated), so this is where
+        # card_verify_PIN_simple, card_verify_PIN), so this is where
         # the channel is guaranteed to exist
         self.card_ensure_secure_channel()
         
@@ -3294,10 +3310,10 @@ class CardConnector:
             else:
                 self.setup_done = d["setup_done"] = True
                 # secure channel status
-            if len(response) >= 12:
-                self.needs_secure_channel = d["needs_secure_channel"] = False if response[11] == 0X00 else True
-            else:
-                self.needs_secure_channel = d["needs_secure_channel"] = False
+            card_requires_secure_channel = len(response) >= 12 and response[11] != 0X00
+            d["needs_secure_channel"] = card_requires_secure_channel
+            if card_requires_secure_channel:
+                self.needs_secure_channel = True
             # NFC policy
             if len(response) >= 13:
                 self.nfc_policy = d["nfc_policy"] = response[12]  # 0:NFC_ENABLED, 1:NFC_DISABLED, 2:NFC_BLOCKED

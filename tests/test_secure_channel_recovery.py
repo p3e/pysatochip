@@ -22,6 +22,8 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir))
 
+from pysatochip.JCconstants import JCconstants
+
 try:
     from pysatochip.CardConnector import CardConnector
 except ImportError as e: # pyscard is not installed
@@ -37,6 +39,14 @@ SW_SC_WRONG_MAC = (0x9C, 0x23)
 # GetBIP32ExtendedKey and InitiateSecureChannel, as sent by the corresponding commands
 APDU_GET_XKEY = [0xB0, 0x6D, 0x03, 0x40, 0x0C] + [0] * 12
 APDU_INITIATE_SC = [0xB0, 0x81, 0x00, 0x00, 0x41] + [0] * 65
+STATUS_WITH_SC_DISABLED = [0x00] * 12
+STATUS_WITH_SC_DISABLED[10] = 0x01              # setup_done
+SENSITIVE_APDUS = (
+    ("setup", [0xB0, JCconstants.INS_SETUP, 0x00, 0x00, 0x04, 1, 2, 3, 4]),
+    ("seed import", [0xB0, JCconstants.INS_BIP32_IMPORT_SEED, 0x04, 0x00, 0x04, 1, 2, 3, 4]),
+    ("private key import", [0xB0, JCconstants.INS_IMPORT_KEY, 0x00, 0x00, 0x04, 1, 2, 3, 4]),
+    ("SeedKeeper import", [0xB0, 0xA1, 0x01, 0x03, 0x04, 1, 2, 3, 4]),
+)
 
 
 class FakeConnection:
@@ -50,6 +60,8 @@ class FakeConnection:
 
     def transmit(self, apdu):
         self.log.append(list(apdu))
+        if apdu[1] == JCconstants.INS_GET_STATUS:
+            return list(STATUS_WITH_SC_DISABLED), SW_OK[0], SW_OK[1]
         if self.session_lost:
             return [], self.sw_when_lost[0], self.sw_when_lost[1]
         if self.requires_encryption and apdu[1] != 0x82:
@@ -73,8 +85,8 @@ class TestSecureChannelRecovery(unittest.TestCase):
 
         def fake_encrypt(apdu):
             cc.n_encrypt += 1
-            # mark the apdu as encrypted: encrypted commands carry ins 0x82
-            return [0xB0, 0x82, 0x00, 0x00, len(apdu)] + list(apdu)
+            # Model an opaque secure-channel wrapper without retaining plaintext.
+            return [0xB0, 0x82, 0x00, 0x00, 0x01, 0xEE]
 
         def fake_initiate():
             cc.n_initiate += 1
@@ -110,6 +122,13 @@ class TestSecureChannelRecovery(unittest.TestCase):
         self.assertEqual((sw1, sw2), SW_OK)
         self.assertEqual(self.cc.n_initiate, 1)
 
+    def test_required_status_retries_only_encrypted(self):
+        response, sw1, sw2 = self.recovery(SW_SC_REQUIRED)
+        self.assertEqual((sw1, sw2), SW_OK)
+        self.assertTrue(self.cc.needs_secure_channel)
+        self.assertEqual(self.cc.n_initiate, 1)
+        self.assertEqual([apdu[1] for apdu in self.card.log], [0x82, 0x82])
+
     def test_persistent_error_surfaces_after_one_retry(self):
         # the card keeps failing (or the PC/SC path is tampered with): the
         # command must fail loudly rather than loop through re-initiations
@@ -119,17 +138,40 @@ class TestSecureChannelRecovery(unittest.TestCase):
         self.assertEqual(self.cc.n_initiate, 1)
         self.assertEqual(len(self.card.log), 2)
 
-    def test_secure_channel_required_switches_to_encrypted(self):
-        # a plaintext command is rejected with 0x9C20: the client learns that
-        # the card requires a secure channel and retries encrypted
-        self.cc.needs_secure_channel = False
+    def test_false_status_cannot_expose_sensitive_commands(self):
+        # A hostile zero status must not expose the first protected command
+        # before secure-channel recovery could run.
         self.card.requires_encryption = True
-        response, sw1, sw2 = self.cc.card_transmit(APDU_GET_XKEY)
+        for name, apdu in SENSITIVE_APDUS:
+            with self.subTest(command=name):
+                self.card.log = []
+                self.cc.needs_secure_channel = False
+                _response, sw1, sw2, status = self.cc.card_get_status()
+                self.assertFalse(status["needs_secure_channel"])
+                response, sw1, sw2 = self.cc.card_transmit(apdu)
+                self.assertEqual((sw1, sw2), SW_OK)
+                self.assertEqual(self.cc.n_initiate, 0)
+                self.assertEqual([sent[1] for sent in self.card.log],
+                                 [JCconstants.INS_GET_STATUS, 0x82])
+
+    def test_plaintext_status_cannot_downgrade_policy(self):
+        self.cc.needs_secure_channel = True
+        response, sw1, sw2, status = self.cc.card_get_status()
         self.assertEqual((sw1, sw2), SW_OK)
+        self.assertFalse(status["needs_secure_channel"])
         self.assertTrue(self.cc.needs_secure_channel)
-        self.assertEqual(self.cc.n_initiate, 1)
-        self.assertEqual(self.cc.n_encrypt, 1)
-        self.assertEqual([apdu[1] for apdu in self.card.log], [0x6D, 0x82])
+        self.assertEqual([apdu[1] for apdu in self.card.log],
+                         [JCconstants.INS_GET_STATUS])
+
+    def test_pin_helpers_ignore_false_status_policy(self):
+        for method_name in ("card_verify_PIN_simple", "card_verify_PIN"):
+            with self.subTest(method=method_name):
+                self.card.log = []
+                self.cc.needs_secure_channel = False
+                self.cc.card_get_status()
+                getattr(self.cc, method_name)("123456")
+                self.assertEqual([apdu[1] for apdu in self.card.log],
+                                 [JCconstants.INS_GET_STATUS, 0x82])
 
     def test_initiate_command_is_not_reinitiated(self):
         # an error status on the 0x81 exchange itself must come back to the

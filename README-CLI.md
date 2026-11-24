@@ -16,6 +16,21 @@ python3 satochip-cli satochip-sign-message --help
 
 _There are also some general tools, such as those required to decrypt encrypted Seedkeeper JSON backups. (These can be accessed either standalone or via the module)_
 
+### Decrypting a SeedKeeper JSON backup
+
+Encrypted backup decryption requires two values retained independently from the
+JSON file: the exporting SeedKeeper's authentikey and the backup SHA-256 printed
+by `seedkeeper-export-secret` or `seedkeeper-export-secret-to-satochip` when the
+backup is created. Store the SHA-256 separately from the backup so replacing the
+JSON cannot replace its integrity check at the same time.
+
+```commandline
+satochip-cli util-decrypt-secret-export --json-file backup.json --authentikey-exporter <trusted-exporter-authentikey> --backup-sha256 <recorded-backup-sha256>
+```
+
+Do not derive either trusted value from a backup whose provenance is in doubt;
+doing so would only check that the file is internally consistent.
+
 ## installation
 
 To install Pysatochip with the command line feature, you can use this command:

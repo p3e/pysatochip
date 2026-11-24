@@ -42,7 +42,7 @@ from pysatochip.CardConnector import (CardConnector, IncorrectUnlockCodeError, I
                                       IdentityBlockedError, WrongPinError, CardObjectAlreadyPresentError)
 from pysatochip.JCconstants import *
 from pysatochip.Satochip2FA import Satochip2FA, SERVER_LIST
-from pysatochip.SecretDecryption import Decrypt_Secret
+from pysatochip.SecretDecryption import BACKUP_FORMAT_VERSION, Decrypt_Secret, export_data_hash
 from pysatochip.electrum_mnemonic import Mnemonic as electrum_mnemonic
 from pysatochip.electrum_mnemonic import seed_type as electrum_seedtype
 from pysatochip.util import list_hyphenated_values, dict_swap_keys_values
@@ -2140,6 +2140,7 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                 secret_dict_pubkey = cc.seedkeeper_export_secret(pubkey_id)
                 authentikey_importer = secret_dict_pubkey['secret'][2:]  # [0:2] is the pubkey_size in hex
                 secret_obj = {
+                    'format_version': BACKUP_FORMAT_VERSION,
                     'authentikey_exporter': cc.parser.authentikey.get_public_key_bytes(False).hex(),
                     'authentikey_importer': authentikey_importer,
                     'secrets': [{
@@ -2158,6 +2159,7 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                     }],
                 }
                 print("Secret Export (JSON to Import into another card/device)")
+                print("Backup SHA-256 (store separately from the JSON):", export_data_hash(secret_obj))
                 print(json.dumps(secret_obj))
     except Exception as e:
         print(e)
@@ -2180,6 +2182,7 @@ def seedkeeper_export_secret_to_satochip(sid, pubkey_id):
         secret_dict_pubkey = cc.seedkeeper_export_secret(pubkey_id)
         authentikey_importer = secret_dict_pubkey['secret'][2:]  # [0:2] is the pubkey_size in hex
         secret_obj = {
+            'format_version': BACKUP_FORMAT_VERSION,
             'authentikey_exporter': cc.parser.authentikey.get_public_key_bytes(False).hex(),
             'authentikey_importer': authentikey_importer,
             'secrets': [{
@@ -2198,6 +2201,7 @@ def seedkeeper_export_secret_to_satochip(sid, pubkey_id):
             }],
         }
         print("Secret Export (JSON to Import into another card/device)")
+        print("Backup SHA-256 (store separately from the JSON):", export_data_hash(secret_obj))
         print(json.dumps(secret_obj))
     except Exception as e:
         print(e)
@@ -3214,7 +3218,11 @@ def satocash_serialize_tokenv4(tokenv4_dic) -> str:
 
 @main.command()
 @click.option("--json-file", required=True, help="File containing the encrypted secret")
-def util_decrypt_secret_export(json_file):
+@click.option("--authentikey-exporter", required=True,
+              help="Trusted exporter authentikey obtained independently of the JSON backup")
+@click.option("--backup-sha256", required=True,
+              help="SHA-256 commitment recorded when the backup was created")
+def util_decrypt_secret_export(json_file, authentikey_exporter, backup_sha256):
     """Tool to Decrypt Encrypted Seedkeeper Exports"""
     try:
         # Opening JSON and loading file
@@ -3222,7 +3230,7 @@ def util_decrypt_secret_export(json_file):
         export_data = json.load(f)
 
         privkey = input("Enter your private key:")
-        secrets = Decrypt_Secret(privkey, export_data)
+        secrets = Decrypt_Secret(privkey, export_data, authentikey_exporter, backup_sha256)
         for secret in secrets:
             print(secret)
     except Exception as e:

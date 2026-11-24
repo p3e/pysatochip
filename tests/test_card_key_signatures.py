@@ -55,6 +55,68 @@ class CardKeyTestCase(unittest.TestCase):
         self.cc.card_transmit = lambda apdu: (self.response, 0x90, 0x00)
 
 
+class TestSecureChannelAuthentication(unittest.TestCase):
+    """The ECDH peer is accepted only when the expected card signs it."""
+
+    def setUp(self):
+        if not ec_backend.available_backends():
+            self.skipTest("no hardened EC backend available")
+        self.parser = CardDataParser()
+        self.authentikey = ECPubkey(ec_backend.privkey_to_pubkey(
+            AUTHENTIKEY_SECRET, compressed=False))
+        self.parser.authentikey_from_storage = self.authentikey
+
+    def build(self, signer=AUTHENTIKEY_SECRET):
+        peer = ec_backend.privkey_to_pubkey(
+            EPHEMERAL_SECRET, compressed=False)
+        msg = [0x00, 0x20] + list(peer[1:33])
+        self_sig = der_sign(EPHEMERAL_SECRET, msg)
+        msg2 = msg + [len(self_sig) >> 8, len(self_sig) & 0xff] + self_sig
+        sig2 = [] if signer is None else der_sign(signer, msg2)
+        return msg2 + [len(sig2) >> 8, len(sig2) & 0xff] + sig2
+
+    def test_accepts_complete_authentikey_signature(self):
+        peer = self.parser.parse_initiate_secure_channel(self.build())
+        self.assertEqual(
+            peer.get_public_key_bytes(compressed=False),
+            ec_backend.privkey_to_pubkey(EPHEMERAL_SECRET, compressed=False))
+
+    def test_persisted_authentikey_overrides_untrusted_current_key(self):
+        self.parser.authentikey = ECPubkey(ec_backend.privkey_to_pubkey(
+            ATTACKER_SECRET, compressed=False))
+        peer = self.parser.parse_initiate_secure_channel(self.build())
+        self.assertEqual(peer, ECPubkey(ec_backend.privkey_to_pubkey(
+            EPHEMERAL_SECRET, compressed=False)))
+        self.assertEqual(self.parser.authentikey, self.authentikey)
+        self.assertEqual(
+            self.parser.authentikey_coordx,
+            list(self.authentikey.get_public_key_bytes(False)[1:33]))
+
+    def test_rejects_missing_authentikey_signature(self):
+        with self.assertRaises(ValueError):
+            self.parser.parse_initiate_secure_channel(self.build(signer=None))
+        self.assertIsNone(getattr(self.parser, "pubkey", None))
+
+    def test_rejects_truncated_authentikey_signature(self):
+        response = self.build()
+        with self.assertRaises(ValueError):
+            self.parser.parse_initiate_secure_channel(response[:-10])
+        self.assertIsNone(getattr(self.parser, "pubkey", None))
+
+    def test_rejects_signature_from_another_card(self):
+        with self.assertRaises(ValueError):
+            self.parser.parse_initiate_secure_channel(
+                self.build(signer=ATTACKER_SECRET))
+
+    def test_rejects_handshake_without_expected_authentikey(self):
+        self.parser.authentikey_from_storage = None
+        self.parser.authentikey = ECPubkey(ec_backend.privkey_to_pubkey(
+            ATTACKER_SECRET, compressed=False))
+        with self.assertRaises(ValueError):
+            self.parser.parse_initiate_secure_channel(
+                self.build(signer=ATTACKER_SECRET))
+
+
 class TestLiquidBlindingKey(CardKeyTestCase):
     """response = [keySize(2) | blindingKey | sigSize(2) | sig]"""
 

@@ -217,37 +217,58 @@ class CardDataParser:
         return pubkey
 
     def parse_initiate_secure_channel(self, response):
-            logger.debug("In parse_initiate_secure_channel")
-            # double signature: first is self-signed, second by authentikey (optional)
-            # firs self-signed sig: data= coordx
-            #logger.debug(f'parse_initiate_secure_channel: first signature recovery')
-            data_size = ((response[0] & 0xff)<<8) + (response[1] & 0xff)
-            data= response[2:(2+data_size)]
-            msg_size= 2+data_size
-            msg= response[0:msg_size]
-            sig_size = ((response[msg_size] & 0xff)<<8) + (response[msg_size+1] & 0xff)
-            signature= response[(msg_size+2):(msg_size+2+sig_size)]
-            if sig_size==0:
-               raise ValueError("Signature missing")
-            # self-signed
-            coordx=data
-            self.pubkey= self.get_pubkey_from_signature(coordx, msg, signature)
-            self.pubkey_coordx= coordx
-            
-            # second signature by authentikey (optional)
-            #logger.debug(f'parse_initiate_secure_channel: second signature recovery')
-            msg2_size= msg_size+2+sig_size
-            sig2_size = ((response[msg2_size] & 0xff)<<8) + (response[msg2_size+1] & 0xff)  
-            if sig2_size>0 and self.authentikey_coordx:
-                msg2= response[0:msg2_size]
-                signature2= response[(msg2_size+2):(msg2_size+2+sig2_size)] 
-                authentikey= self.get_pubkey_from_signature(self.authentikey_coordx, msg2, signature2)
-                if ( authentikey.get_public_key_bytes(compressed=False) != self.authentikey.get_public_key_bytes(compressed=False) ):
-                    raise ValueError("Recovered authentikey does not correspond to registered authentikey!")
-                logger.debug("In parse_initiate_secure_channel: successfuly recovered authentikey:"+ authentikey.get_public_key_bytes(compressed=False).hex()) #debug
-                    
-            logger.debug("In parse_initiate_secure_channel: successfuly recovered pubkey:"+ self.pubkey.get_public_key_bytes(compressed=False).hex()) #debug
-            return (self.pubkey)
+        logger.debug("In parse_initiate_secure_channel")
+
+        # A self-signature proves only possession of the returned ephemeral key.
+        # The authentikey is the trust anchor that binds that key to the expected
+        # card, so never derive channel keys when no previously trusted identity
+        # is available. self.authentikey alone is insufficient because it can be
+        # learned from an unauthenticated response before channel setup.
+        expected_authentikey = self.authentikey_from_storage
+        if expected_authentikey is None:
+            raise ValueError("Trusted authentikey not set!")
+        expected_authentikey_bytes = expected_authentikey.get_public_key_bytes(
+            compressed=False)
+        # Keep the parser's established list-of-bytes representation; Satodime
+        # response validation compares this field directly with response lists.
+        expected_authentikey_coordx = list(expected_authentikey_bytes[1:33])
+
+        # First signature: proof of possession for the ephemeral key.
+        data_size = ((response[0] & 0xff)<<8) + (response[1] & 0xff)
+        data= response[2:(2+data_size)]
+        msg_size= 2+data_size
+        msg= response[0:msg_size]
+        sig_size = ((response[msg_size] & 0xff)<<8) + (response[msg_size+1] & 0xff)
+        signature= response[(msg_size+2):(msg_size+2+sig_size)]
+        if sig_size==0:
+            raise ValueError("Signature missing")
+        if len(signature) != sig_size:
+            raise ValueError("Truncated signature")
+        peer_pubkey = self.get_pubkey_from_signature(data, msg, signature)
+
+        # Second signature: mandatory identity binding over the complete first
+        # signed field, including its declared signature length and signature.
+        msg2_size= msg_size+2+sig_size
+        sig2_size = ((response[msg2_size] & 0xff)<<8) + (response[msg2_size+1] & 0xff)
+        if sig2_size==0:
+            raise ValueError("Authentikey signature missing")
+        msg2= response[0:msg2_size]
+        signature2= response[(msg2_size+2):(msg2_size+2+sig2_size)]
+        if len(signature2) != sig2_size:
+            raise ValueError("Truncated authentikey signature")
+        authentikey = self.get_pubkey_from_signature(
+            expected_authentikey_coordx, msg2, signature2)
+        if authentikey.get_public_key_bytes(compressed=False) != expected_authentikey_bytes:
+            raise ValueError("Recovered authentikey does not correspond to registered authentikey!")
+
+        # Publish parser state only after both signatures have been accepted.
+        self.authentikey = expected_authentikey
+        self.authentikey_coordx = expected_authentikey_coordx
+        self.pubkey = peer_pubkey
+        self.pubkey_coordx = data
+        logger.debug("In parse_initiate_secure_channel: successfully recovered authentikey:"+ expected_authentikey_bytes.hex())
+        logger.debug("In parse_initiate_secure_channel: successfully recovered pubkey:"+ peer_pubkey.get_public_key_bytes(compressed=False).hex())
+        return peer_pubkey
     
     ##############
     def parse_message_signature(self, response, hash, pubkey):
@@ -798,12 +819,3 @@ class CardDataParser:
             raise Exception(f"Satodime error: recovered private key for keyslot {key_nbr} does not match entropy!")
         
         return (entropy_list, privkey_list, sig_list)
-        
-        
-        
-        
-        
-        
-        
-        
-    
